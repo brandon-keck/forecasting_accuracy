@@ -4,7 +4,7 @@ Forecasting weekly unit sales four weeks ahead for 10 Walmart stores across Cali
 
 **Tools:** R · tidyverse · fable / tsibble / feasts · Quarto
 
-📄 **[Read the full report](https://brandon-keck.github.io/forecasting_accuracy/forecasting.html)**
+  📄 **[Read the full report](https://brandon-keck.github.io/forecasting_accuracy/forecasting_accurace.html)**
 
 ---
 
@@ -84,4 +84,4 @@ The ensemble was refit on all data to produce a four-week forecast for all 30 se
 1. Download `sales_train_evaluation.csv` and `calendar.csv` from the [M5 competition page](https://www.kaggle.com/competitions/m5-forecasting-accuracy) (requires accepting the competition rules)
 2. Place them in a `data/` folder in the project root
 3. Install packages: `install.packages(c("tidyverse", "tsibble", "fable", "feasts", "fabletools", "urca"))`
-4. Open `forecasting_accuracy.Rproj` in RStudio and render `forecasting.qmd`
+4. Open `forecasting_accuracy.Rproj` in RStudio and render `forecasting_accurace.qmd`
