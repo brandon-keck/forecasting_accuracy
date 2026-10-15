@@ -1,0 +1,16 @@
+# R / RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Data (download from Kaggle; too large for GitHub)
+data/
+
+# Quarto render support files
+forecasting_files/
+.quarto/
+.Rproj.user
+.httr-oauth
+.DS_Store
+.quarto

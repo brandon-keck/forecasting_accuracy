@@ -1,0 +1,262 @@
+---
+title: "Demand Forecasting"
+author: "Brandon Keck"
+format: 
+  html:
+    embed-resources: true
+---
+
+## Load and reshape the data
+
+```{r}
+library(tidyverse)
+library(tsibble)
+library(feasts)
+library(fable)
+
+
+sales    <- read_csv("data/sales_train_evaluation.csv")
+calendar <- read_csv("data/calendar.csv")
+
+# Total daily units by store and category
+daily <- sales |>
+  group_by(store_id, cat_id) |>
+  summarise(across(starts_with("d_"), sum), .groups = "drop") |>
+  pivot_longer(starts_with("d_"), names_to = "d", values_to = "units") |>
+  left_join(calendar |> select(d, date), by = "d")
+
+# Roll up to complete weeks
+weekly <- daily |>
+  mutate(week = yearweek(date)) |>
+  group_by(store_id, cat_id, week) |>
+  summarise(units = sum(units), days = n(), .groups = "drop") |>
+  filter(days == 7) |>
+  select(-days) |>
+  as_tsibble(key = c(store_id, cat_id), index = week)
+
+weekly
+```
+
+
+
+## Explore the patterns
+```{r}
+# Total weekly sales by category (all stores combined)
+weekly %>% 
+  group_by(cat_id) %>% 
+  summarise(units = sum(units)) %>% 
+  autoplot(units) +
+  labs(title = "Weekly units sold by category", x = NULL, y = "Units")
+
+```
+
+
+# Total weekly sales by store (all categories combined)
+```{r}
+weekly %>% 
+  group_by(store_id) %>% 
+  summarise(units = sum(units)) %>% 
+  ggplot(aes(x = week, y = units)) +
+  geom_line(color = "skyblue") +
+  facet_wrap(~ store_id, ncol = 2, scales = "free_y") +
+  labs(title = "Weekly units sold by store", x = NULL, y = "Units")
+```
+
+
+**Observations:**
+
+- Foods drives most demand and shows a regular monthly pattern, likely tied to SNAP benefit timing
+- All stores dip sharply at Christmas (stores close on Christmas Day)
+- WI_1 and WI_2 show permanent level shifts in late 2012, and CA_2 jumps sharply in mid-2015, likely store expansions or remodels
+- WI_3 and TX_2 decline after peaking in 2012–2013
+
+
+## Baseline forecasts
+```{r}
+# Rolling-origin evaluation: 10 forecast origins over the final weeks
+cv_data <- weekly %>% 
+  stretch_tsibble(.init = 264, .step = 1) %>% 
+  filter(.id <= 10)
+
+baseline_fit <- cv_data %>% 
+  model(
+    naive = NAIVE(units),
+    snaive = SNAIVE(units ~ lag(52)),
+    drift = RW(units ~ drift())
+  )
+
+baseline_fc <- baseline_fit %>% forecast(h = 4)
+
+baseline_acc <- baseline_fc %>% 
+  accuracy(weekly) %>% 
+  group_by(.model) %>% 
+  summarise(MASE = mean(MASE), MAPE = mean(MAPE)) %>% 
+  arrange(MASE)
+
+baseline_acc
+```
+
+**Baseline results:** the naive forecast (next week = this week) performed best, with a MAPE of 7.1%. Seasonal naive performed poorly (12.5%) because store sales levels shifted year over year. Any model we recommend must beat naive.
+
+
+## Forecasting Models
+```{r}
+model_fit <- cv_data |>
+  model(
+    naive         = NAIVE(units),
+    ets           = ETS(units ~ season("N")),
+    arima         = ARIMA(units ~ PDQ(0, 0, 0)),
+    arima_fourier = ARIMA(units ~ fourier(period = 52, K = 3) + PDQ(0, 0, 0))
+  )
+
+model_fc <- model_fit |> forecast(h = 4)
+
+model_acc <- model_fc |>
+  accuracy(weekly) |>
+  group_by(.model) |>
+  summarise(
+    failed = sum(is.na(MASE)),
+    MASE   = mean(MASE, na.rm = TRUE),
+    MAPE   = mean(MAPE, na.rm = TRUE)
+  ) |>
+  arrange(MASE)
+
+model_acc
+```
+
+
+## Ensemble and accuracy by category
+
+```{r}
+# Average the ETS and ARIMA + Fourier forecasts
+model_fit <- model_fit |>
+  mutate(ensemble = (ets + arima_fourier) / 2)
+
+model_fc <- model_fit |> forecast(h = 4)
+
+series_acc <- model_fc |> accuracy(weekly)
+
+# Overall accuracy, including the ensemble
+series_acc |>
+  group_by(.model) |>
+  summarise(MASE = mean(MASE), MAPE = mean(MAPE)) |>
+  arrange(MASE)
+```
+
+
+
+```{r}
+# MAPE by category for each model
+series_acc |>
+  group_by(.model, cat_id) |>
+  summarise(MAPE = mean(MAPE), .groups = "drop") |>
+  pivot_wider(names_from = cat_id, values_from = MAPE) |>
+  arrange(FOODS)
+```
+
+
+## Prediction interval check
+
+```{r}
+interval_check <- model_fc |>
+  filter(.model %in% c("naive", "ensemble")) |>
+  mutate(pi80 = hilo(units, 80), pi95 = hilo(units, 95)) |>
+  unpack_hilo(c(pi80, pi95)) |>
+  as_tibble() |>
+  left_join(
+    weekly |> as_tibble() |> rename(actual = units),
+    by = c("store_id", "cat_id", "week")
+  ) |>
+  group_by(.model) |>
+  summarise(
+    coverage_80 = mean(actual >= pi80_lower & actual <= pi80_upper),
+    coverage_95 = mean(actual >= pi95_lower & actual <= pi95_upper)
+  )
+
+interval_check
+```
+
+
+**Prediction intervals:** the ensemble's 80% and 95% intervals contained actual sales 83.8% and 95.9% of the time, closely matching their targets (slightly conservative). The naive model's intervals were wider than necessary (90.0% and 97.8%).
+
+
+## Final four-week forecast
+
+```{r}
+final_fit <- weekly |>
+  model(
+    ets           = ETS(units ~ season("N")),
+    arima_fourier = ARIMA(units ~ fourier(period = 52, K = 3) + PDQ(0, 0, 0))
+  ) |>
+  mutate(ensemble = (ets + arima_fourier) / 2)
+
+final_fc <- final_fit |>
+  select(ensemble) |>
+  forecast(h = 4)
+
+final_fc
+```
+
+
+
+```{r}
+# Example: Foods at CA_3, the highest-volume store
+dir.create("images", showWarnings = FALSE)
+
+recent <- weekly |>
+  filter(store_id == "CA_3", cat_id == "FOODS", week >= max(week) - 52)
+
+final_fc |>
+  filter(store_id == "CA_3", cat_id == "FOODS") |>
+  autoplot(recent, level = c(80, 95)) +
+  labs(
+    title    = "Four-week forecast with 80% and 95% prediction intervals",
+    subtitle = "Foods, store CA_3 (ensemble of ETS and ARIMA with Fourier terms)",
+    x = NULL, y = "Units per week"
+  ) +
+  theme_minimal()
+
+ggsave("images/forecast_example.png", width = 9, height = 4.5, dpi = 200, bg = "white")
+```
+
+
+
+
+
+```{r}
+acc_summary <- series_acc |>
+  group_by(.model) |>
+  summarise(MAPE = mean(MAPE)) |>
+  mutate(
+    label = case_when(
+      .model == "naive"         ~ "Naive (benchmark)",
+      .model == "ets"           ~ "ETS",
+      .model == "arima"         ~ "ARIMA",
+      .model == "arima_fourier" ~ "ARIMA + Fourier",
+      .model == "ensemble"      ~ "Ensemble (ETS + ARIMA/Fourier)"
+    ),
+    highlight = .model == "ensemble"
+  )
+
+ggplot(acc_summary, aes(x = MAPE, y = reorder(label, -MAPE), fill = highlight)) +
+  geom_col() +
+  geom_text(aes(label = sprintf("%.1f%%", MAPE)), hjust = -0.15) +
+  scale_fill_manual(values = c(`TRUE` = "#2b6cb0", `FALSE` = "#9aa5b1"), guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "All models beat the naive benchmark, 
+    and the ensemble is most accurate",
+    subtitle = "Average four-week-ahead error across 30 store-category
+    series (10 rolling forecast origins)",
+    x = "MAPE (%)", y = NULL
+  ) +
+  theme_minimal()
+
+ggsave("images/model_comparison.png", width = 9, height = 4, dpi = 200, bg = "white")
+```
+
+
+
+
+
+
